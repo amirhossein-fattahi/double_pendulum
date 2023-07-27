@@ -20,8 +20,7 @@ from double_pendulum.utils.wrap_angles import wrap_angles_top
 from double_pendulum.utils.wrap_angles import wrap_angles_diff
 
 # setting log path for the training
-# log_dir = "./log_data/SAC_training"
-log_dir = "./log_data_designC.1/SAC_training"
+log_dir = "./log_data/SAC_training"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
@@ -51,10 +50,10 @@ if robot == "pendubot":
 
 elif robot == "acrobot":
     torque_limit = [0.0, 5.0]
-    design = "design_C.1"
-    model = "model_1.0"
+    design = "design_C.0"
+    model = "model_3.0"
     load_path = "lqr_data/acrobot/lqr/roa"
-    warm_start_path = "/home/chi/Github/double_pendulum/examples/reinforcement_learning/SAC/saved_models/acrobot/design_C.1/model_1.0/candidate_2/best_model.zip"
+    warm_start_path = "/examples/reinforcement_learning/SAC/saved_models/acrobot/design_C.0/model_3.0/gymnasium_5e7/acrobot_model.zip"
     # define para for quadratic reward
     Q = np.zeros((4, 4))
     Q[0, 0] = 10.0
@@ -97,7 +96,7 @@ termination = False
 
 #tuning parameter
 n_envs = 100 # we found n_envs > 50 has very little improvement in training speed.
-training_steps = 2e7 # default = 1e6
+training_steps = 3e7 # default = 1e6
 verbose = 1
 # reward_threshold = -0.01
 reward_threshold = 3e7
@@ -127,10 +126,11 @@ def check_if_state_in_roa(S, rho, x):
 def reward_func(observation, action):
     # define reward para according to robot type
     control_line = 0.4
-    v_thresh = 8.0
+    v_thresh = 10.0
     vflag = False
     flag = False
     bonus = False
+    stab = False
 
     # state
     s = np.array(
@@ -173,7 +173,7 @@ def reward_func(observation, action):
     bonus, rad = check_if_state_in_roa(S, rho, y)
 
     # criteria 3: velocity check
-    if flag and (np.abs(y[2]) > v_thresh or np.abs(y[3]) > v_thresh):
+    if (np.abs(y[2]) > v_thresh or np.abs(y[3]) > v_thresh):
         vflag = True
 
 
@@ -181,6 +181,11 @@ def reward_func(observation, action):
     ## stage1: quadratic reward
     r = np.einsum("i, ij, j", s - goal, Q, s - goal) + np.einsum("i, ij, j", u, R, u)
     reward = -1.0 * r
+
+    ## penalize on high velocity
+    if vflag:
+        print("oops")
+        reward -= r_vel
 
     ## stage2: control line reward
     if flag:
@@ -190,10 +195,9 @@ def reward_func(observation, action):
             # roa method
             reward += r_lqr
             print("!!!bonus = True")
-        ## penalize on high velocity
-        if vflag:
-            print("oops")
-            reward -= r_vel
+            if stab:
+                reward += 1e4
+
     else:
         reward = reward
 
@@ -290,11 +294,9 @@ agent = SAC(
     learning_rate=learning_rate,
 )
 
-warm_start = True
-# warm_start = False
+# warm_start = True
+warm_start = False
 if warm_start:
     agent.set_parameters(load_path_or_dict=warm_start_path)
 
 agent.learn(total_timesteps=training_steps, callback=eval_callback)
-
-
