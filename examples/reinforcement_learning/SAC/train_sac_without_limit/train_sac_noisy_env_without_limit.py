@@ -23,29 +23,29 @@ from gym_env import (
 from double_pendulum.utils.wrap_angles import wrap_angles_top
 from double_pendulum.utils.wrap_angles import wrap_angles_diff
 
-# setting log path for training
+# setting log path for the training
 log_dir = "./log_data_designC.1/SAC_training"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
-# robot setup definition
+# define robot variation
 # robot = "acrobot"
 robot = "pendubot"
+friction_compensation = True
 
-# model and reward parameter setting
+# model and reward parameter
 max_velocity = 20
-warm_start = True
 if robot == "pendubot":
     torque_limit = [5.0, 0.0]
     design = "design_C.1"
     model = "model_1.0"
     load_path = "../../../../data/controller_parameters/design_C.1/model_1.1/pendubot/lqr/"
-    # load_path = "lqr_data/pendubot/lqr/roa"
-    warm_start_path = "/home/chi/Github/double_pendulum/examples/reinforcement_learning/SAC/train_sac_without_limit/saved_model/pendubot/working_2e7_new/best_model.zip"
+    # warm_start_path = "/home/chi/Github/double_pendulum/examples/reinforcement_learning/SAC/train_sac_without_limit/saved_model/pendubot/working_2e7_new/best_model.zip"
+    warm_start_path = "/home/chi/Github/double_pendulum/data/policies/design_C.1/model_1.0/pendubot/SAC/best_model.zip"
     # define para for quadratic reward
     Q = np.zeros((4, 4))
-    Q[0, 0] = 100.0
-    Q[1, 1] = 100.0
+    Q[0, 0] = 100
+    Q[1, 1] = 100
     Q[2, 2] = 1.0
     Q[3, 3] = 1.0
     R = np.array([[0.01]])
@@ -53,24 +53,65 @@ if robot == "pendubot":
     r_vel = 0
     r_lqr = 1e5
 
+
 elif robot == "acrobot":
     torque_limit = [0.0, 5.0]
     design = "design_C.1"
     model = "model_1.0"
-    load_path = "../../../../data/controller_parameters/design_C.1/model_1.1/acrobot/lqr/"
-    warm_start_path = "/home/chi/Github/double_pendulum/examples/reinforcement_learning/SAC/train_sac_without_limit/saved_model/acrobot/4e7_interesting/best_model.zip"
+    # design = "design_C.0"
+    # model = "model_3.0"
+    load_path = "lqr_data/design_C.1/model_1.1/acrobot/lqr"
+    warm_start_path = "/home/chi/Github/double_pendulum/examples/reinforcement_learning/SAC/saved_models/acrobot/design_C.1/model_1.0/working/best_model.zip"
     # define para for quadratic reward
     Q = np.zeros((4, 4))
-    Q[0, 0] = 100.0
-    Q[1, 1] = 100.0
-    Q[2, 2] = 1.0
-    Q[3, 3] = 1.0
-    R = np.array([[0.001]])
-    r_line = 1e4
-    r_vel = 1e3
-    r_lqr = 1e5
+    Q[0, 0] = 10.0
+    Q[1, 1] = 10.0
+    Q[2, 2] = 0.2
+    Q[3, 3] = 0.2
+    R = np.array([[0.0001]])
+    r_line = 500
+    r_vel = 1e4
+    r_lqr = 1e4
 
-# define model parameter path
+#tuning parameter
+n_envs = 100 # we found n_envs > 50 has very little improvement in training speed.
+training_steps = 1e7 # default = 1e6
+verbose = 1
+# reward_threshold = -0.01
+reward_threshold = 1e10
+eval_freq=2500
+n_eval_episodes=10
+learning_rate=0.01
+
+# simulation parameters
+dt = 0.01
+t_final = 10.0
+integrator = "runge_kutta"
+goal = [np.pi, 0.0, 0.0, 0.0]
+## noise
+process_noise_sigmas = [0.0, 0.0, 0.0, 0.0]
+meas_noise_sigmas = [0.0, 0.0, 0.5, 0.5]
+delay_mode = "None"
+delay = 0.015
+u_noise_sigmas = [0., 0.]
+# u_responsiveness = 1.0
+u_responsiveness = 0.90
+perturbation_times = []
+perturbation_taus = []
+
+## filter args
+meas_noise_vfilter = "lowpass"
+meas_noise_cut = 0.1
+filter_kwargs = {"lowpass_alpha": [1., 1., 0.2, 0.2],
+                 "kalman_xlin": goal,
+                 "kalman_ulin": [0., 0.],
+                 "kalman_process_noise_sigmas": process_noise_sigmas,
+                 "kalman_meas_noise_sigmas": meas_noise_sigmas,
+                 "ukalman_integrator": integrator,
+                 "ukalman_process_noise_sigmas": process_noise_sigmas,
+                 "ukalman_meas_noise_sigmas": meas_noise_sigmas}
+##########################################################################################################
+# import model
 model_par_path = (
         "../../../../data/system_identification/identified_parameters/"
         + design
@@ -79,20 +120,36 @@ model_par_path = (
         + "/model_parameters.yml"
 )
 
-# load model parameters
+# model for simulation
 mpar = model_parameters(filepath=model_par_path)
 mpar.set_motor_inertia(0.0)
 mpar.set_damping([0.0, 0.0])
 mpar.set_cfric([0.0, 0.0])
 mpar.set_torque_limit(torque_limit)
 
-# load dynamics and simulator
-dt = 0.01
-integrator = "runge_kutta"
 plant = SymbolicDoublePendulum(model_pars=mpar)
-simulator = Simulator(plant=plant)
+sim = Simulator(plant=plant)
 
-#===========================================================================================
+sim.set_process_noise(process_noise_sigmas=process_noise_sigmas)
+sim.set_measurement_parameters(meas_noise_sigmas=meas_noise_sigmas,
+                               delay=delay,
+                               delay_mode=delay_mode)
+sim.set_motor_parameters(u_noise_sigmas=u_noise_sigmas,
+                         u_responsiveness=u_responsiveness)
+
+# switching conditions
+rho = np.loadtxt(os.path.join(load_path, "rho"))
+vol = np.loadtxt(os.path.join(load_path, "vol"))
+S = np.loadtxt(os.path.join(load_path, "Smatrix"))
+flag = False
+
+def check_if_state_in_roa(S, rho, x):
+    # print(x)
+    xdiff = x - np.array([np.pi, 0.0, 0.0, 0.0])
+    rad = np.einsum("i,ij,j", xdiff, S, xdiff)
+    # print(rad, rho)
+    return rad < 1.0*rho, rad
+
 # define learning parameters
 state_representation = 2
 obs_space=gym.spaces.Box(
@@ -102,51 +159,15 @@ act_space=gym.spaces.Box(np.array([-1.0]), np.array([1.0]))
 max_steps = 1000
 termination = False
 
-# define tuning parameters for training
-n_envs = 100 # we found n_envs > 50 has very little improvement in training speed.
-training_steps = 3e7 # default = 1e6
-verbose = 1
-reward_threshold = 1e10
-eval_freq=5000
-n_eval_episodes=5
-learning_rate=0.01
-
-#=========================================================================================
-# initialize dynamics
+# initialize double pendulum dynamics
 dynamics_func = double_pendulum_dynamics_func(
-    simulator=simulator,
+    simulator=sim,
     dt=dt,
     integrator=integrator,
     robot=robot,
-    state_representation=state_representation,
-    scaling = False
+    state_representation=2,
 )
 
-# import LQR parameters for stabilization
-rho = np.loadtxt(os.path.join(load_path, "rho"))
-vol = np.loadtxt(os.path.join(load_path, "vol"))
-S = np.loadtxt(os.path.join(load_path, "Smatrix"))
-
-#===========================================================================================
-# for testing
-print(robot)
-print(design)
-print(model)
-print("LQR load path=", load_path)
-print("model parameter path=", model_par_path)
-print("warm start status=", warm_start)
-if warm_start:
-    print("warm start path=",warm_start_path)
-
-#============================================================================================
-# defne roa checking function
-def check_if_state_in_roa(S, rho, x):
-    xdiff = x - np.array([np.pi, 0.0, 0.0, 0.0])
-    # calculate cost-to-go
-    rad = np.einsum("i,ij,j", xdiff, S, xdiff)
-    return rad < rho, rad
-
-# define reward_function without scaling
 def reward_func(observation, action):
     """
     This function is the step reward function for reinforcement learning.
@@ -243,8 +264,6 @@ def terminated_func(observation):
 #     # this is when termination doesn't take place
 #     return False
 
-## reset function(both noisy and zero)
-# this is when observation is unscaled
 def noisy_reset_func():
     rand = np.random.rand(4) * 0.1
     rand[:] = rand[:] - 0.05
@@ -253,17 +272,6 @@ def noisy_reset_func():
 def zero_reset_func():
     observation = [0.0, 0.0, 0.0, 0.0]
     return observation
-#================================================
-# # this when observation is scaled
-# def noisy_reset_func():
-#     rand = np.random.rand(4) * 0.01
-#     rand[2:] = rand[2:] - 0.05
-#     observation = [-1.0, -1.0, 0.0, 0.0] + rand
-#     return observation
-#
-# def zero_reset_func():
-#     observation = [-1.0, -1.0, 0.0, 0.0]
-#     return observation
 
 #========================================================================
 ## initialize different environments
@@ -294,7 +302,6 @@ envs = make_vec_env(
         "scaling":False
     },
 )
-
 # evaluation env
 eval_env = CustomEnv(
     dynamics_func=dynamics_func,
