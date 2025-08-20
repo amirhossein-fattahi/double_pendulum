@@ -45,3 +45,46 @@ experiments/icra_2025/data/*
 
 
 .idea/
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.log
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build / cache
+dist/
+build/
+*.so
+
+# Large/binary artifacts
+*.pyd
+*.dll
+*.lib
+*.exe
+*.zip
+*.pth
+*.pt
+*.onnx
+*.pkl
+*.ckpt
+*.npy
+*.npz
+
+# RL / experiments
+runs/
+tensorboard/
+checkpoints/
+ppo_*/           # if you save models here
