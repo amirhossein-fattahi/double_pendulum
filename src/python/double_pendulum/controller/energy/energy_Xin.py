@@ -2,9 +2,15 @@ import os
 import yaml
 import numpy as np
 from scipy.optimize import minimize
+from scipy.linalg import solve_continuous_are
+
 
 from double_pendulum.controller.abstract_controller import AbstractController
 from double_pendulum.model.symbolic_plant import SymbolicDoublePendulum
+from double_pendulum.controller.lqr.lqr_controller import LQRController
+
+def wrap_angle(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
 class EnergyController(AbstractController):
@@ -86,6 +92,9 @@ class EnergyController(AbstractController):
         self.Ir = motor_inertia
         self.gr = gear_ratio
         self.torque_limit = torque_limit
+        self.sink_reached = False
+        self.scores = []
+
 
         if model_pars is not None:
             self.mass = model_pars.m
@@ -98,6 +107,9 @@ class EnergyController(AbstractController):
             self.Ir = model_pars.Ir
             self.gr = model_pars.gr
             self.torque_limit = model_pars.tl
+            self.sink_reached = False
+            self.scores = []
+
 
         self.plant = SymbolicDoublePendulum(mass=self.mass,
                                             length=self.length,
@@ -158,7 +170,7 @@ class EnergyController(AbstractController):
                        bounds=((0, 2.*np.pi),),
                        args=(a1, a2, a3, b1, b2, self.desired_energy))
 
-        d_val = -res.fun[0]
+        d_val = -res.fun
 
         # kp
         p_val = 2/np.pi*np.min([b1**2., b2**2.])
@@ -186,6 +198,9 @@ class EnergyController(AbstractController):
         Initialize the controller.
         """
         self.en = []
+
+    #def wrap_angle(angle):
+    #    return (angle + np.pi) % (2 * np.pi) - np.pi
 
     def get_control_output_(self, x, t=None):
         """
@@ -235,6 +250,20 @@ class EnergyController(AbstractController):
 
         u2 = np.clip(u2, -self.torque_limit[1], self.torque_limit[1])
         u = [0., u2]
+
+
+        # ----- Sink Region Detection -----
+        if not self.sink_reached:
+            x1_wrapped = wrap_angle(x[0])
+            x2_wrapped = wrap_angle(x[1])
+            score = abs(x1_wrapped - np.pi) + abs(x2_wrapped) + 0.1 * abs(x[2]) + 0.1 * abs(x[3])
+            self.scores.append(score)
+            #print(f"[NO SINK DETECTED] x = {x}, score = {score:.5f}")
+            if score < 0.05:
+                print(f"[SINK DETECTED] , score = {score:.5f}")
+                print(self.torque_limit)
+                self.sink_reached = True
+        # ----------------------------------
 
         return u
 
@@ -302,3 +331,113 @@ def kd_func(q2, a1, a2, a3, b1, b2, Er):
 
     f = (Phi+Er)*Del / M11
     return -f
+
+
+
+class EnergyLQRController(AbstractController):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.energy_controller = EnergyController(**kwargs)
+        self.lqr_controller = LQRController(**kwargs)
+        self.lqr_controller.set_goal([np.pi, 0, 0, 0])
+        self.lqr_controller.init_()
+        self.plant = self.energy_controller.plant
+        self.lqr_enabled = False
+        #elf.lqr_K = self.compute_lqr_gain()
+
+    def compute_lqr_gain(self):
+        """Compute LQR Gain Matrix K"""
+        A, B = self.linearize_dynamics()
+        Q = np.diag([10, 10, 1, 1])
+        R = np.diag([1, 1])
+        P = solve_continuous_are(A, B, Q, R)
+        K = np.linalg.inv(R) @ B.T @ P
+        return K
+
+    def linearize_dynamics(self):
+        """Linearize the system around upright equilibrium point"""
+        x_eq = [np.pi, 0, 0, 0]
+        u_eq = [0, 0]
+        A = np.zeros((4, 4))
+        B = np.zeros((4, 2))
+        delta = 1e-5
+
+        for i in range(4):
+            dx = np.zeros(4)
+            dx[i] = delta
+            f1 = self.plant.rhs(0, x_eq + dx, u_eq)
+            f2 = self.plant.rhs(0, x_eq - dx, u_eq)
+            A[:, i] = (f1 - f2)/(2*delta)
+
+        for i in range(2):
+            du = np.zeros(2)
+            du[i] = delta
+            f1 = self.plant.rhs(0, x_eq, u_eq + du)
+            f2 = self.plant.rhs(0, x_eq, u_eq - du)
+            B[:, i] = (f1 - f2)/(2*delta)
+
+        return A, B
+    
+    def check_mode_switch(self, x):
+        """Check if the state is in the attraction region"""
+        theta1, theta2, omega1, omega2 = x
+        theta2 = (theta2 + np.pi) % (2*np.pi) - np.pi
+        theta1 = theta1 % (2*np.pi)
+        #print([theta1, theta2])
+        in_region = (np.abs(theta1 - np.pi) < 0.012 and np.abs(theta2) < 0.01 and np.abs(omega1) < 0.01 and np.abs(omega2) < 0.018)
+        #print(in_region)
+        #if in_region:
+        #    print(f"Entering LQR Region at t={t}, x={x}")  # DEBUG PRINT
+
+        return in_region
+    
+    def get_control_output_(self, x, t=None):
+        """Compute control output with mode switching"""
+        #print(f"get_control_output_() called at t={t}, x={x}")  # DEBUG PRINT
+        
+        theta1, theta2, omega1, omega2 = x
+        theta2 = (theta2 + np.pi) % (2*np.pi) - np.pi
+        theta1 = theta1 % (2*np.pi)
+
+
+        if self.lqr_enabled:
+            if not self.check_mode_switch(x):
+                print(1)
+                self.lqr_enabled = False
+        
+        if self.lqr_enabled or self.check_mode_switch(x):
+            if not self.lqr_enabled:
+                print(2)
+                #print(self.lqr_controller.R)
+                #print(self.lqr_controller.Q)
+                #print([(theta1 - np.pi), theta2, omega1, omega2])
+            self.lqr_enabled = True
+            #theta1, theta2, omega1, omega2 = x
+            #theta2 = (theta2 + np.pi) % (2*np.pi) - np.pi
+            #theta1 = theta1 % (2*np.pi)
+            #x_error = np.array([theta1 - np.pi, theta2, omega1, omega2])
+            
+            u = self.lqr_controller.get_control_output_(x, t)
+            
+            
+            #u = -self.lqr_K @ x_error
+            #u[0] = 0.0
+
+        else:
+            #print(3)
+            u = self.energy_controller.get_control_output_(x,t)
+
+
+
+        #if self.lqr_enabled or self.check_mode_switch(x):
+        #    if not self.lqr_enabled:
+        #        print(f"LQR Activated at x={x}")  # DEBUG PRINT
+        #    self.lqr_enabled = True
+        #    x_error = np.array([x[0] - np.pi, x[1], x[2], x[3]])
+        #    u = -self.lqr_K @ x_error
+        #    print(f"LQR Control Applied: u={u}")  # DEBUG PRINT
+        #else:
+            #print("Using Energy Controller")  # DEBUG PRINT
+        #    u = self.energy_controller.get_control_output_(x, t)
+        
+        return np.clip(u, -self.energy_controller.torque_limit[1], self.energy_controller.torque_limit[1])
