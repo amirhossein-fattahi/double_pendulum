@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 import yaml
+import matplotlib.pyplot as plt
 import numpy as np
 
 from double_pendulum.model.symbolic_plant import SymbolicDoublePendulum
@@ -9,13 +10,18 @@ from double_pendulum.simulation.simulation import Simulator
 from double_pendulum.utils.plotting import plot_timeseries
 from double_pendulum.utils.csv_trajectory import save_trajectory
 from double_pendulum.controller.energy.energy_Xin import EnergyController
+from double_pendulum.controller.energy.energy_Xin import EnergyLQRController
+
+
+def wrap_angle(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
 
 # model parameters
 design = "design_A.0"
 model = "model_1.0"
 robot = "acrobot"
 
-torque_limit = [0.0, 5.0]
+torque_limit = [0.0, 15.0]
 active_act = 1
 
 model_par_path = "../../data/system_identification/identified_parameters/"+design+"/"+model+"/model_parameters.yml"
@@ -34,18 +40,18 @@ x0 = [0.1, 0.0, 0.0, 0.0]
 t_final = 60.0
 
 # controller parameters
-kp = 0.68  # > 0.67
-kd = 0.023  # > 0.022
-kv = 0.015  # > 0.0
+kp = 2.35  # > 0.67
+kd = 0.3  # > 0.022
+kv = 0.3  # > 0.0
 
 plant = SymbolicDoublePendulum(model_pars=mpar)
 sim = Simulator(plant=plant)
 
-controller = EnergyController(model_pars=mpar)
-controller.set_parameters(kp=kp, kd=kd, kv=kv)
-controller.set_goal(goal)
-# controller.check_parameters()
-controller.init()
+controller = EnergyLQRController(model_pars=mpar)
+controller.energy_controller.set_parameters(kp=kp, kd=kd, kv=kv)
+controller.energy_controller.set_goal(goal)
+#controller.energy_controller.check_parameters()
+controller.energy_controller.init()
 
 T, X, U = sim.simulate_and_animate(t0=0.0,
                                    x0=x0,
@@ -57,8 +63,8 @@ T, X, U = sim.simulate_and_animate(t0=0.0,
                                    save_video=False)
 
 # controller.save(path)
-energy = controller.en
-des_energy = controller.desired_energy
+energy = controller.energy_controller.en
+des_energy = controller.energy_controller.desired_energy
 
 # saving and plotting
 timestamp = datetime.today().strftime("%Y%m%d-%H%M%S")
@@ -73,12 +79,38 @@ save_trajectory(csv_path=os.path.join(save_dir, "trajectory.csv"),
 mpar.save_dict(os.path.join(save_dir, "model_parameters.yml"))
 controller.save(save_dir)
 
+#U = np.array(U).reshape(-1, 1)
+
+
 plot_timeseries(T=T, X=X, U=U, energy=energy,
                 plot_energy=True,
                 pos_y_lines=[-np.pi, np.pi],
                 tau_y_lines=[-torque_limit[active_act], torque_limit[active_act]],
                 energy_y_lines=[des_energy],
                 save_to=os.path.join(save_dir, "time_series"))
+
+final_state = X[-1]
+# Wrap only angle components (theta1 and theta2)
+theta1_err = wrap_angle(final_state[0]) - np.pi
+theta2_err = wrap_angle(final_state[1])
+
+# Velocity components (no wrapping needed)
+theta1_dot_err = final_state[2] - goal[2]
+theta2_dot_err = final_state[3] - goal[3]
+
+# Error vector
+error_vec = np.array([theta1_err, theta2_err, theta1_dot_err, theta2_dot_err])
+error = np.linalg.norm(error_vec)
+
+#print("Final error norm to goal:", error)
+
+#plt.plot(controller.scores)
+#plt.title("Sink Score Over Time")
+##plt.axhline(0.04, color='red', linestyle='--', label='Sink Threshold')
+#plt.legend()
+#plt.show()
+
+
 
 # par_dict = {
 #             "dt": dt,
