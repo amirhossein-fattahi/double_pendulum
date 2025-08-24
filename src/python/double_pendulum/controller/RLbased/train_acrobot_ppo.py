@@ -17,8 +17,8 @@ def main():
         e = gym.wrappers.TimeLimit(e, max_episode_steps=1000)
         return e
 
-    train_env = VecNormalize(DummyVecEnv([make_env]*8), norm_obs=True, norm_reward=True, clip_obs=10.0)
-    eval_env  = VecNormalize(DummyVecEnv([make_env]*8), norm_obs=True, norm_reward=False, clip_obs=10.0)
+    train_env = VecNormalize(DummyVecEnv([make_env]*8), norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
+    eval_env = VecNormalize(DummyVecEnv([make_env]*8), norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
 
     # Optional: check if env follows Gym API
     #check_env(env, warn=True)
@@ -27,7 +27,7 @@ def main():
     #model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./ppo_acrobot_tensorboard/", 
     #            learning_rate=3e-4, n_steps=2048, batch_size=64, gamma=0.99)
 
-    policy_kwargs = dict(net_arch=dict(pi=[256,256], vf=[256,256]))
+    policy_kwargs = dict(log_std_init=-1.0, net_arch=dict(pi=[128,128], vf=[256,256]))
 
     model = PPO(
         "MlpPolicy",
@@ -35,14 +35,14 @@ def main():
         verbose=1,
         tensorboard_log=tb_log,
         # ← key hyperparams tuned for continuous control
-        n_steps=4096,
-        batch_size=512,
+        n_steps=16384,
+        batch_size=4096,
         n_epochs=20,
         gamma=0.995,
-        gae_lambda=0.98,
-        clip_range=0.1,
+        gae_lambda=0.95,
+        clip_range=0.2,
         learning_rate=3e-4, # constant (no linear decay)
-        ent_coef=0.1,
+        ent_coef=0.001,
         vf_coef=0.5,
         use_sde=True,
         sde_sample_freq=4,
@@ -63,7 +63,7 @@ def main():
     checkpoint_callback = CheckpointCallback(save_freq=5000, save_path='./checkpoints/', name_prefix='ppo_acrobot')
 
     model.learn(
-        total_timesteps=1000_000,
+        total_timesteps=24000000,
         callback=[checkpoint_callback, eval_callback]
     )
 

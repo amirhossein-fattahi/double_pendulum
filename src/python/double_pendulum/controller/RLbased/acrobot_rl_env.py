@@ -39,6 +39,12 @@ class AcrobotRLEnv(gym.Env):
         self.max_steps = 1000
         self.step_count = 0
 
+        self.vel_limit1 = 30.0
+        self.vel_limit2 = 40.0
+        self.obs_clip = 5.0          # final safety clip for observation normalization
+        self.nan_penalty = -50.0     # penalty when the step produces non-finite values
+
+
         # --- Observation space: [theta1, theta2, theta1_dot, theta2_dot]
         # update observation_space to match 6-dim features
         high = np.array([1,1,1,1,30.0,40.0], dtype=np.float32)
@@ -71,107 +77,105 @@ class AcrobotRLEnv(gym.Env):
         def wrap_pi(a):
             return (a + np.pi) % (2*np.pi) - np.pi
 
-        # --- torque + integration
+        # 1) Torque (squash + clip)
         torque = float(np.clip(action[0], -self.max_torque, self.max_torque))
         u = [0.0, torque]
-        x = self.state
-        x_dot = self.plant.rhs(0.0, x.tolist(), u)
-        x_dot = np.array(x_dot, dtype=np.float32)
+
+        # 2) One-step integration in float64 (more stable), then convert back
+        x = self.state.astype(np.float64, copy=False)
+        try:
+            x_dot = np.asarray(self.plant.rhs(0.0, x.tolist(), u), dtype=np.float64)
+        except Exception:
+            # If the plant throws, cut the episode
+            obs = self._obs(self.state)
+            return obs, self.nan_penalty, False, True, {"err": "rhs_failed"}
+
         x_next = x + self.dt * x_dot
-        self.state = x_next
+
+        # 3) Wrap angles, clip velocities (avoid energy/velocity blow-ups)
+        th1, th2, d1, d2 = x_next
+        th1 = wrap_pi(th1)
+        th2 = wrap_pi(th2)
+        d1 = float(np.clip(d1, -self.vel_limit1, self.vel_limit1))
+        d2 = float(np.clip(d2, -self.vel_limit2, self.vel_limit2))
+        self.state = np.array([th1, th2, d1, d2], dtype=np.float32)
         self.step_count += 1
 
-        # --- symbols (clipped velocities for reward stability)
-        th1, th2, d1, d2 = map(float, x_next)
-        th1, th2 = wrap_pi(th1), wrap_pi(th2)
-        total = th1 + th2
-        err   = wrap_pi(total - np.pi)
-        d1c, d2c = np.clip(d1, -20.0, 20.0), np.clip(d2, -20.0, 20.0)
-        vtop = d1c + d2c                         # angular speed around the top
-        H = 0.5 * (1.0 - np.cos(total))          # height proxy in [0,1]
-        in_upper = (H > 0.5)
-        upright_zone = (abs(err) < 0.15)
+        # 4) Safety: if anything non-finite → truncate episode with penalty
+        if not np.isfinite(self.state).all():
+            obs = np.nan_to_num(self._obs(self.state), nan=0.0, posinf=0.0, neginf=0.0)
+            return obs, self.nan_penalty, False, True, {"err": "non_finite_state"}
 
-        # --- energy (used lightly; not to dominate reward)
+        # ---------- reward shaping ----------
+        total = th1 + th2
+        err = wrap_pi(total - np.pi)
+
+        # Height progress term
+        H = 0.5 * (1.0 - np.cos(total))       # [0, 1]
+        H_prev = getattr(self, "_H_prev", H)
+        dH = H - H_prev
+        self._H_prev = H
+        r_height_prog = 12.0 * dH
+
+        # Stay in upper half
+        r_upper_stay = 4.0 * np.clip(H - 0.5, 0.0, 0.5) * 2.0
+
+        # Upright precision bump
+        r_upright = 2.0 * np.exp(- (err / 0.25)**2)
+
+        # Energy progress (compute with clipped velocities to avoid overflow)
         m1, m2 = self.plant.m[0], self.plant.m[1]
         l1, l2 = self.plant.l[0], self.plant.l[1]
         g = 9.81
         E_target = m1*g*l1 + m2*g*(l1 + l2)
-        Ep = m1*g*l1*(1 - np.cos(th1)) + m2*g*(l1*(1 - np.cos(th1)) + l2*(1 - np.cos(th1+th2)))
-        Ek = 0.5*m1*(l1*d1c)**2 + 0.5*m2*((l1*d1c)**2 + (l2*(d1c+d2c))**2 + 2*l1*l2*d1c*(d1c+d2c)*np.cos(th2))
-        E = Ep + Ek
+
+        # Use clipped velocities d1, d2 (already clipped)
+        Ep = m1*g*l1*(1 - np.cos(th1)) + m2*g*(l1*(1 - np.cos(th1)) + l2*(1 - np.cos(th1 + th2)))
+        Ek = 0.5*m1*(l1*d1)**2 + 0.5*m2*((l1*d1)**2 + (l2*(d1 + d2))**2 + 2*l1*l2*d1*(d1 + d2)*np.cos(th2))
+        E  = Ep + Ek
         E_prev = getattr(self, "_E_prev", E)
         dE = E - E_prev
         self._E_prev = E
+        r_dE = 0.5 * np.sign(E_target - E) * (dE / (E_target + 1e-6))
 
-        # --- init mode flags
-        if not hasattr(self, "mode"):
-            self.mode = "swing"
-            self.capture_count = 0
+        # Smoothness
+        r_smooth = -0.0008*(d1**2 + d2**2) - 0.0005*(torque/self.max_torque)**2
 
-        # --- capture logic: switch to BALANCE after brief calm near top
-        capture_ok = (H > 0.5 and abs(err) < 0.5 and abs(vtop) < 2.5)
-        self.capture_count = (self.capture_count + 1) if capture_ok else 0
-        if self.mode == "swing" and self.capture_count >= 5:
-            self.mode = "balance"
-
-        ### REWARD
-        if self.mode == "swing":
-            # Height progress (big driver to escape bottom)
-            H_prev = getattr(self, "_H_prev", H)
-            dH = H - H_prev
-            self._H_prev = H
-            r_height_prog = 5.0 * H
-
-            # Reward being in upper half (keeps going once it gets there)
-            r_upper = 2.0 * np.clip(H - 0.5, 0.0, 0.5) * 2.0
-
-            # Energy pumping term: reward speed when it helps move away from bottom.
-            # |sin(total)|≈0 near top -> no pumping there; large on the sides.
-            r_pump = 0.8 * abs(vtop) * abs(np.sin(total))
-
-            # Very light use of dE toward E_target (normalized)
-            r_dE = 0.3 * np.sign(E_target - E) * (dE / (E_target + 1e-6))
-
-            # Small smoothness penalty (don’t over‑penalize here)
-            r_sm = -0.0005*(d1c**2 + d2c**2) - 0.0002*(torque/self.max_torque)**2
-
-            reward = float(r_height_prog + r_upper + r_pump + r_dE + r_sm)
-
+        # NEW: very strong "stay still at upright" reward (dominates inside a tight cone)
+        upright_zone = (abs(err) < 0.12)
+        if upright_zone:
+            # Quadratic penalty for residual velocities; weight high so PPO prefers to stop there
+            r_stability = 4.0 - 0.08*(abs(d1) + abs(d2)) - 0.0005*(d1**2 + d2**2)
         else:
-            ### BALANCE MODE 
-            Q_err = 50.0
-            Q_d1  = 6.0
-            Q_d2  = 6.0
-            R_u   = 0.002
+            r_stability = 0.0
 
-            cost = Q_err*(err**2) + Q_d1*(d1c**2) + Q_d2*(d2c**2) + R_u*((torque/self.max_torque)**2)
-            r_hold = 10.0 - cost
-            r_no_orbit = -0.15 * abs(vtop)
+        reward = float(r_height_prog + r_upper_stay + r_upright + r_dE + r_smooth + r_stability)
 
-            reward = float(r_hold + r_no_orbit)
-
-            # If it drifts away, go back to swing‑up
-            if (H < 0.4) or (abs(err) > 0.7):
-                self.mode = "swing"
-                self.capture_count = 0
-
-        # Success bonus for sustained quiet upright
-        if upright_zone and abs(d1c) < 0.4 and abs(d2c) < 0.4:
+        # --------- success / truncation ----------
+        # Make the capture condition tighter and longer to truly "park" there
+        if upright_zone and abs(d1) < 0.35 and abs(d2) < 0.35:
             self.upright_counter += 1
-            if self.upright_counter==10:
-                reward += 100
-            reward += 2.0
+            reward += 3.0   # per-step bonus while balanced
         else:
             self.upright_counter = 0
 
-        terminated = (self.upright_counter >= 20)
+        terminated = (self.upright_counter >= 150)  # ~3 seconds at dt=0.02
         truncated  = (self.step_count >= self.max_steps)
 
+        # 5) Final obs (safety clip so VecNormalize never sees huge numbers)
+        obs = self._obs(self.state)
+        obs = np.clip(obs, -self.obs_clip, self.obs_clip)
+        if not np.isfinite(obs).all():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+            truncated = True
+            reward += self.nan_penalty
+
+        # temp
         if self.step_count == 1:
             print("first step -> terminated:", terminated, "truncated:", truncated)
 
-        return self._obs(self.state), float(reward), terminated, truncated, {}
+        return obs, reward, terminated, truncated, {}
+
 
 
     def _compute_reward(self, state, torque):
