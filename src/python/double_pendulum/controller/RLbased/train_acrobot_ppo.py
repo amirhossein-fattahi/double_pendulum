@@ -8,17 +8,17 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.callbacks import EvalCallback
 from acrobot_rl_env import AcrobotRLEnv
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 
 def main():
     def make_env():
-        e = AcrobotRLEnv()
-        e = gym.wrappers.TimeLimit(e, max_episode_steps=1000)
-        return e
+        env = AcrobotRLEnv()
+        # optional: cap episode length here if you prefer
+        return Monitor(env)  # fixes the SB3 warning and logs ep_len/ep_rew
 
-    train_env = VecNormalize(DummyVecEnv([make_env]*8), norm_obs=True, norm_reward=True, clip_obs=5.0, clip_reward=10.0)
-    eval_env = VecNormalize(DummyVecEnv([make_env]*8), norm_obs=True, norm_reward=False, clip_obs=5.0, clip_reward=10.0)
+    env = make_env()
 
     # Optional: check if env follows Gym API
     #check_env(env, warn=True)
@@ -27,33 +27,37 @@ def main():
     #model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./ppo_acrobot_tensorboard/", 
     #            learning_rate=3e-4, n_steps=2048, batch_size=64, gamma=0.99)
 
-    policy_kwargs = dict(log_std_init=-1.0, net_arch=dict(pi=[128,128], vf=[256,256]))
+    policy_kwargs = dict(
+        net_arch=[128, 128],      # smaller nets are fine
+        log_std_init=0.0,         # std ~ 1.0 initial; encourages exploration
+        # ortho_init=True (default), activation_fn=nn.Tanh (default)
+    )
 
     model = PPO(
         "MlpPolicy",
-        train_env,
-        verbose=1,
-        tensorboard_log=tb_log,
-        # ← key hyperparams tuned for continuous control
-        n_steps=16384,
-        batch_size=4096,
-        n_epochs=20,
-        gamma=0.995,
+        env,
+        policy_kwargs=policy_kwargs,
+        learning_rate=3e-4,
+        n_steps=4096,             # longer rollouts so it can discover swing-up
+        batch_size=1024,
+        n_epochs=10,
+        gamma=0.995,              # slightly longer horizon
         gae_lambda=0.95,
         clip_range=0.2,
-        learning_rate=3e-4, # constant (no linear decay)
-        ent_coef=0.001,
+        ent_coef=0.02,            # more exploration; you can drop to 0.005-0.01 later
         vf_coef=0.5,
-        use_sde=True,
-        sde_sample_freq=4,
-        max_grad_norm=0.5,
-        policy_kwargs=policy_kwargs
+        target_kl=0.02,           # stops updates if policy moves too fast
+        verbose=1,
+        tensorboard_log="./ppo_acrobot_tensorboard",
+        seed=0,
+        device="auto",
     )
+
     # evaluation env (no VecNormalize, just raw)
     #eval_env = AcrobotRLEnv()
     # now pass eval_env into EvalCallback
     eval_callback = EvalCallback(
-        eval_env,
+        env,
         best_model_save_path="./logs/best_model",
         log_path="./logs/eval",
         eval_freq=5_000,
@@ -63,11 +67,11 @@ def main():
     checkpoint_callback = CheckpointCallback(save_freq=5000, save_path='./checkpoints/', name_prefix='ppo_acrobot')
 
     model.learn(
-        total_timesteps=24000000,
+        total_timesteps=2_400_000,
         callback=[checkpoint_callback, eval_callback]
     )
 
-    train_env.save("./checkpoints/vecnormalize.pkl")
+    #env.save("./checkpoints/vecnormalize.pkl")
     model.save("./checkpoints/ppo_acrobot.zip")
     #env.save("ppo_acrobot_vecnormalize")
 
